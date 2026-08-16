@@ -1,0 +1,16 @@
+This Colab notebook (gw_sbi_colab.ipynb) has two parts:
+
+Part 1 — Single-detector baseline. Builds a restricted post-Newtonian gravitational-wave waveform model and an analytic Advanced LIGO noise
+curve from scratch, simulates thousands of noisy synthetic detections, and trains a neural posterior estimator (SBI, via the sbi package) to
+infer 4 source parameters: chirp mass, mass ratio, distance, and inclination. Validates the trained network by recovering an injected test event, 
+running a calibration check (are true values uniformly ranked across the posterior?), and timing amortized inference against a brute-force likelihood grid.
+
+Part 2 — Three-detector network. Extends the model to Hanford, Livingston, and Virgo using real detector geometry — actual 
+antenna-pattern response and light-travel-time delays, verified against published inter-detector timing values. Expands inference 
+to 7 parameters by adding sky position (RA/dec) and polarization angle, and demonstrates the real astrophysical degeneracies this creates,
+especially the multimodal "mirror-sky" localization ambiguity.
+
+Every cell was executed end-to-end during development to confirm it runs without errors on a standard Colab CPU runtime
+, with plots (waveform/noise sanity checks, posterior corner plots, sky-localization scatter, calibration histograms) 
+rendering correctly throughout. A closing section lists concrete next steps (real waveform models, real GWOSC data validation, 
+spins, MCMC benchmarking) for anyone wanting to push the project toward publication quality.
