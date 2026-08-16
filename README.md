@@ -1,0 +1,2 @@
+# imulation-Based-Inference-for-Gravitational-Wave-Parameter-Estimation
+SBI for gravitational-wave parameter estimation: trains a neural posterior estimator on simulated LIGO/Virgo/Hanford data to infer binary merger parameters (mass, distance, sky position) in milliseconds instead of hours via MCMC. Includes real 3-detector geometry, calibration checks, and sky-localization degeneracies. Runs end-to-end on free colab.
