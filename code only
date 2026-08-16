@@ -1,0 +1,319 @@
+#@title Install dependencies (Colab)
+# !pip install sbi torch corner -q   # uncomment if running in Colab / a fresh environment
+
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from sbi.inference import NPE
+from sbi.utils import BoxUniform
+from sbi.analysis import pairplot
+import time
+
+torch.manual_seed(0)
+np.random.seed(0)
+
+# Physical constants (SI)
+G = 6.67430e-11
+c = 2.99792458e8
+Msun = 1.98892e30
+Mpc = 3.0856775814913673e22
+
+
+# ---- Frequency grid ----
+f_low, f_high, Nf = 20.0, 512.0, 128
+freqs = np.linspace(f_low, f_high, Nf)
+df = freqs[1] - freqs[0]
+
+# ---- Analytic aLIGO PSD (Ajith 2011 fit) ----
+def aLIGO_psd(f):
+    f0 = 150.0
+    x = f / f0
+    return 1e-49 * (np.power(4.49*x, -56) + 0.16*np.power(x, -4.52) + 0.52 + 0.32*x**2)
+
+psd = aLIGO_psd(freqs)
+
+# ---- Restricted 2PN TaylorF2 waveform, frequency domain ----
+def waveform(Mc_msun, q, DL_mpc, cos_iota, tc=0.0, phic=0.0):
+    Mc = Mc_msun * Msun * G / c**3          # chirp mass in seconds (geometric units)
+    eta = q / (1 + q)**2                     # symmetric mass ratio
+    Mtot = Mc * eta**(-3/5)                  # total mass in seconds
+    DL = DL_mpc * Mpc
+
+    v = (np.pi * Mtot * freqs) ** (1/3)
+    f_isco = 1.0 / (6**1.5 * np.pi * Mtot)   # innermost stable circular orbit cutoff
+    band = freqs < f_isco
+
+    # 2PN non-spinning TaylorF2 phase coefficients
+    a2 = 3715/756 + 55/9*eta
+    a3 = -16*np.pi
+    a4 = 15293365/508032 + 27145/504*eta + 3085/72*eta**2
+
+    psi = (2*np.pi*freqs*tc - phic - np.pi/4
+           + (3/(128*eta*v**5)) * (1 + a2*v**2 + a3*v**3 + a4*v**4))
+
+    amp0 = np.sqrt(5/24) * np.pi**(-2/3) * Mc**(5/6) * freqs**(-7/6) / (DL/c)
+    incl_factor = (1 + cos_iota**2) / 2       # plus-polarization inclination dependence
+
+    h = amp0 * incl_factor * np.exp(1j*psi)
+    return h * band
+
+def whiten(h):
+    return h / np.sqrt(psd / (4*df))
+
+
+theta_demo = [28.0, 0.85, 500.0, 0.3]   # Mc, q, DL, cos(iota)
+h_demo = waveform(*theta_demo)
+noise_demo = (np.random.randn(Nf) + 1j*np.random.randn(Nf)) * np.sqrt(psd/(4*df))
+d_demo = h_demo + noise_demo
+
+fig, axes = plt.subplots(1, 2, figsize=(11,4))
+axes[0].loglog(freqs, np.abs(h_demo), label='signal |h(f)|')
+axes[0].loglog(freqs, np.sqrt(psd), label='aLIGO ASD', alpha=0.7)
+axes[0].set_xlabel('frequency [Hz]'); axes[0].legend(); axes[0].set_title('Signal vs noise amplitude')
+
+axes[1].plot(freqs, whiten(d_demo).real, lw=0.8, label='whitened data (Re)')
+axes[1].plot(freqs, whiten(h_demo).real, lw=1.5, label='whitened signal (Re)')
+axes[1].set_xlabel('frequency [Hz]'); axes[1].legend(); axes[1].set_title('Whitened strain')
+plt.tight_layout(); plt.show()
+
+
+def simulate_np(theta):
+    Mc, q, DL, cosi = theta
+    h = waveform(Mc, q, DL, cosi)
+    noise = (np.random.randn(Nf) + 1j*np.random.randn(Nf)) * np.sqrt(psd/(4*df))
+    dw = whiten(h + noise)
+    return np.concatenate([dw.real, dw.imag]).astype(np.float32)
+
+low  = torch.tensor([15.0, 0.5, 200.0, -1.0])
+high = torch.tensor([40.0, 1.0, 1000.0, 1.0])
+prior = BoxUniform(low=low, high=high)
+
+
+N_SIMS = 3000  # increase for better posterior quality; 3000 trains in ~1-2 min on CPU
+
+thetas = prior.sample((N_SIMS,))
+xs = torch.stack([torch.from_numpy(simulate_np(t.numpy())) for t in thetas])
+print("Simulated training set:", thetas.shape, xs.shape)
+
+inference = NPE(prior=prior)
+inference.append_simulations(thetas, xs)
+
+t0 = time.time()
+density_estimator = inference.train()
+print(f"Training took {time.time()-t0:.1f} s")
+
+posterior = inference.build_posterior(density_estimator)
+
+
+true_theta = np.array([28.0, 0.85, 500.0, 0.3])
+x_obs = torch.from_numpy(simulate_np(true_theta))
+
+t0 = time.time()
+samples = posterior.sample((3000,), x=x_obs)
+print(f"Drew 3000 posterior samples in {time.time()-t0:.4f} s (this is the 'amortized' speed-up)")
+
+print("Posterior mean:", samples.mean(0).numpy())
+print("True values:   ", true_theta)
+
+fig, axes = pairplot(
+    samples,
+    labels=[r'$\mathcal{M}_c\ [M_\odot]$', r'$q$', r'$D_L$ [Mpc]', r'$\cos\iota$'],
+    points=true_theta,
+    points_colors='r',
+    figsize=(7,7),
+)
+plt.suptitle("Recovered posterior vs. true injected parameters", y=1.02)
+plt.show()
+
+
+N_CALIB = 40
+ranks_mc, ranks_dl = [], []
+
+for _ in range(N_CALIB):
+    th = prior.sample((1,))[0]
+    xo = torch.from_numpy(simulate_np(th.numpy()))
+    s = posterior.sample((300,), x=xo, show_progress_bars=False)
+    ranks_mc.append((s[:,0] < th[0]).float().mean().item())
+    ranks_dl.append((s[:,2] < th[2]).float().mean().item())
+
+fig, axes = plt.subplots(1,2, figsize=(10,3.5))
+axes[0].hist(ranks_mc, bins=10, range=(0,1), edgecolor='k')
+axes[0].axhline(N_CALIB/10, color='r', ls='--', label='ideal (uniform)')
+axes[0].set_title('Calibration: chirp mass'); axes[0].set_xlabel('rank statistic'); axes[0].legend()
+
+axes[1].hist(ranks_dl, bins=10, range=(0,1), edgecolor='k')
+axes[1].axhline(N_CALIB/10, color='r', ls='--', label='ideal (uniform)')
+axes[1].set_title('Calibration: distance'); axes[1].set_xlabel('rank statistic'); axes[1].legend()
+plt.tight_layout(); plt.show()
+
+
+def log_likelihood_grid(Mc, DL, q_fixed, cosi_fixed, x_obs_complex_raw):
+    h = waveform(Mc, q_fixed, DL, cosi_fixed)
+    r = whiten(x_obs_complex_raw - h)
+    return -0.5*np.sum(r.real**2 + r.imag**2)
+
+x_obs_np = x_obs.numpy()
+x_obs_complex = (x_obs_np[:Nf] + 1j*x_obs_np[Nf:]) * np.sqrt(psd/(4*df))  # back to raw units
+
+t0 = time.time()
+Mc_grid = np.linspace(15, 40, 60)
+DL_grid = np.linspace(200, 1000, 60)
+grid_ll = np.zeros((60,60))
+for i, mc in enumerate(Mc_grid):
+    for j, dl in enumerate(DL_grid):
+        grid_ll[i,j] = log_likelihood_grid(mc, dl, true_theta[1], true_theta[3], x_obs_complex)
+grid_time = time.time() - t0
+
+t0 = time.time()
+_ = posterior.sample((3000,), x=x_obs, show_progress_bars=False)
+sbi_time = time.time() - t0
+
+print(f"Grid likelihood (60x60=3600 pts, only 2 of 4 params): {grid_time:.3f} s  -- PER EVENT")
+print(f"Amortized NPE (3000 full 4D posterior samples):       {sbi_time:.4f} s  -- PER EVENT (after one training run)")
+print(f"\nSpeed-up: ~{grid_time/sbi_time:.0f}x, and the grid only covers 2 of 4 parameters.")
+print("A full 4D grid at the same resolution would need 60^4 ≈ 13,000,000 likelihood evaluations.")
+
+
+# ---- Real detector geometry (Jaranowski-Krolak-Schutz: latitude, arm-bisector angle gamma) ----
+# Source: published LIGO/Virgo site coordinates and orientation (Hanford/Livingston survey docs;
+# Virgo/Cascina location). zeta = 90 deg (right-angle arms) for all three.
+R_earth = 6371e3  # m, spherical-Earth approximation
+DEG = np.pi/180
+
+detectors = {
+    'H1': dict(lat=46.45*DEG, gamma=171.80*DEG, lon=-119.4077*DEG),
+    'L1': dict(lat=30.56*DEG, gamma=243.00*DEG, lon=-90.7742*DEG),
+    'V1': dict(lat=43.63*DEG, gamma=116.50*DEG, lon=10.50*DEG),
+}
+zeta = 90*DEG
+
+psd_ligo = aLIGO_psd(freqs)
+psd_virgo = psd_ligo * 2.5   # simplified: current Virgo is somewhat less sensitive than design aLIGO
+det_psd = {'H1': psd_ligo, 'L1': psd_ligo, 'V1': psd_virgo}
+
+def antenna_pattern(lat, gamma, lst, dec, psi):
+    '''Jaranowski-Krolak-Schutz (1998) long-wavelength-limit antenna pattern.'''
+    a = ((1/16)*np.sin(2*gamma)*(3-np.cos(2*lat))*(3-np.cos(2*dec))*np.cos(2*lst)
+         - (1/4)*np.cos(2*gamma)*np.sin(lat)*(3-np.cos(2*dec))*np.sin(2*lst)
+         + (1/4)*np.sin(2*gamma)*np.sin(2*lat)*np.sin(2*dec)*np.cos(lst)
+         - (1/2)*np.cos(2*gamma)*np.cos(lat)*np.sin(2*dec)*np.sin(lst)
+         + (3/4)*np.sin(2*gamma)*np.cos(lat)**2*np.cos(dec)**2)
+    b = (np.cos(2*gamma)*np.sin(lat)*np.sin(dec)*np.cos(2*lst)
+         + (1/4)*np.sin(2*gamma)*(1+np.sin(lat)**2)*np.sin(dec)*np.sin(2*lst)
+         + np.cos(2*gamma)*np.cos(lat)*np.cos(dec)*np.cos(lst)
+         + (1/2)*np.sin(2*gamma)*np.sin(2*lat)*np.cos(dec)*np.sin(lst))
+    Fp = np.sin(zeta)*(a*np.cos(2*psi) + b*np.sin(2*psi))
+    Fx = np.sin(zeta)*(b*np.cos(2*psi) - a*np.sin(2*psi))
+    return Fp, Fx
+
+def det_position(lat, lon):
+    return R_earth*np.array([np.cos(lat)*np.cos(lon), np.cos(lat)*np.sin(lon), np.sin(lat)])
+
+def time_delay(det, ra, dec, gmst0=0.0):
+    '''Light-travel-time delay of `det` relative to the geocenter, for a source at (ra, dec).'''
+    lst_det = gmst0 + detectors[det]['lon']
+    r_det = det_position(detectors[det]['lat'], lst_det)
+    n_hat = np.array([np.cos(dec)*np.cos(ra), np.cos(dec)*np.sin(ra), np.sin(dec)])
+    return -np.dot(r_det, n_hat)/c
+
+# Quick geometry sanity check: real H1-L1 max delay is 10 ms, H1-V1 is ~27 ms
+test_ra = np.random.uniform(0, 2*np.pi, 3000)
+test_dec = np.arcsin(np.random.uniform(-1, 1, 3000))
+dHL = np.array([time_delay('H1',r,d)-time_delay('L1',r,d) for r,d in zip(test_ra,test_dec)])
+dHV = np.array([time_delay('H1',r,d)-time_delay('V1',r,d) for r,d in zip(test_ra,test_dec)])
+print(f"H1-L1 delay range: {dHL.min()*1e3:.2f} to {dHL.max()*1e3:.2f} ms (published: ±10 ms)")
+print(f"H1-V1 delay range: {dHV.min()*1e3:.2f} to {dHV.max()*1e3:.2f} ms (published: ±27 ms)")
+
+
+def plus_cross(Mc_msun, q, DL_mpc, cos_iota):
+    '''Plus/cross frequency-domain polarizations (restricted 2PN TaylorF2, same phasing as Part 1).'''
+    Mc = Mc_msun * Msun * G / c**3
+    eta = q / (1 + q)**2
+    Mtot = Mc * eta**(-3/5)
+    DL = DL_mpc * Mpc
+    v = (np.pi * Mtot * freqs) ** (1/3)
+    f_isco = 1.0 / (6**1.5 * np.pi * Mtot)
+    band = freqs < f_isco
+    a2 = 3715/756 + 55/9*eta
+    a3 = -16*np.pi
+    a4 = 15293365/508032 + 27145/504*eta + 3085/72*eta**2
+    psi_ph = (3/(128*eta*v**5)) * (1 + a2*v**2 + a3*v**3 + a4*v**4)
+    amp0 = np.sqrt(5/24) * np.pi**(-2/3) * Mc**(5/6) * freqs**(-7/6) / (DL/c)
+    hp = amp0 * ((1+cos_iota**2)/2) * np.exp(1j*psi_ph) * band
+    hx = amp0 * cos_iota * np.exp(1j*(psi_ph + np.pi/2)) * band
+    return hp, hx
+
+def simulate_network(theta):
+    '''7 params -> concatenated whitened (real,imag) data across H1, L1, V1.'''
+    Mc, q, DL, cosi, ra, sindec, psi = theta
+    dec = np.arcsin(np.clip(sindec, -1, 1))
+    hp, hx = plus_cross(Mc, q, DL, cosi)
+    out = []
+    for det in detectors:
+        lst = detectors[det]['lon'] - ra
+        Fp, Fx = antenna_pattern(detectors[det]['lat'], detectors[det]['gamma'], lst, dec, psi)
+        dt = time_delay(det, ra, dec)
+        h_det = (Fp*hp + Fx*hx) * np.exp(-2j*np.pi*freqs*dt)
+        psd_d = det_psd[det]
+        noise = (np.random.randn(Nf) + 1j*np.random.randn(Nf)) * np.sqrt(psd_d/(4*df))
+        dw = (h_det + noise) / np.sqrt(psd_d/(4*df))
+        out.append(dw.real); out.append(dw.imag)
+    return np.concatenate(out).astype(np.float32)
+
+# 7D prior: Mc, q, DL, cos(iota), RA, sin(dec) [correct isotropic-sky variable], psi
+low2  = torch.tensor([15.0, 0.5, 200.0, -1.0, 0.0,      -1.0, 0.0])
+high2 = torch.tensor([40.0, 1.0, 1000.0, 1.0, 2*np.pi,   1.0, np.pi])
+prior2 = BoxUniform(low=low2, high=high2)
+
+
+N_SIMS_NET = 6000  # ~1 s to simulate, ~10-20 s to train on Colab CPU
+
+thetas2 = prior2.sample((N_SIMS_NET,))
+t0 = time.time()
+xs2 = torch.stack([torch.from_numpy(simulate_network(t.numpy())) for t in thetas2])
+print(f"Simulated {N_SIMS_NET} 3-detector events in {time.time()-t0:.1f} s -- data dim {xs2.shape[1]}")
+
+inference2 = NPE(prior=prior2)
+inference2.append_simulations(thetas2, xs2)
+t0 = time.time()
+de2 = inference2.train()
+print(f"Training took {time.time()-t0:.1f} s")
+posterior2 = inference2.build_posterior(de2)
+
+
+true_theta2 = np.array([28.0, 0.85, 500.0, 0.3, 1.2, np.sin(0.4), 0.7])
+x_obs2 = torch.from_numpy(simulate_network(true_theta2))
+samples2 = posterior2.sample((3000,), x=x_obs2)
+
+labels2 = [r'$\mathcal{M}_c$', r'$q$', r'$D_L$', r'$\cos\iota$', 'RA', r'$\sin(\delta)$', r'$\psi$']
+fig, axes = pairplot(samples2, labels=labels2, points=true_theta2, points_colors='r', figsize=(9,9))
+plt.suptitle("7-parameter network posterior (3 detectors)", y=1.02)
+plt.show()
+
+fig2, ax2 = plt.subplots(figsize=(6,4))
+ax2.scatter(samples2[:,4], np.arcsin(samples2[:,5].numpy().clip(-1,1)), s=3, alpha=0.3)
+ax2.axvline(true_theta2[4], color='r', ls='--', label='true RA')
+ax2.axhline(np.arcsin(true_theta2[5]), color='r', ls=':', label='true dec')
+ax2.set_xlabel('RA [rad]'); ax2.set_ylabel('declination [rad]')
+ax2.set_title('Sky localization posterior (watch for mirror-image modes)')
+ax2.legend(); plt.tight_layout(); plt.show()
+
+
+N_CALIB2 = 30
+ranks_mc2, ranks_dl2 = [], []
+for _ in range(N_CALIB2):
+    th = prior2.sample((1,))[0]
+    xo = torch.from_numpy(simulate_network(th.numpy()))
+    s = posterior2.sample((300,), x=xo, show_progress_bars=False)
+    ranks_mc2.append((s[:,0] < th[0]).float().mean().item())
+    ranks_dl2.append((s[:,2] < th[2]).float().mean().item())
+
+fig, axes = plt.subplots(1,2, figsize=(10,3.5))
+axes[0].hist(ranks_mc2, bins=10, range=(0,1), edgecolor='k')
+axes[0].axhline(N_CALIB2/10, color='r', ls='--', label='ideal (uniform)')
+axes[0].set_title('Network calibration: chirp mass'); axes[0].legend()
+axes[1].hist(ranks_dl2, bins=10, range=(0,1), edgecolor='k')
+axes[1].axhline(N_CALIB2/10, color='r', ls='--', label='ideal (uniform)')
+axes[1].set_title('Network calibration: distance'); axes[1].legend()
+plt.tight_layout(); plt.show()
